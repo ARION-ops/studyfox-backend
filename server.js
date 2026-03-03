@@ -10,7 +10,10 @@ const crypto = require("crypto");
 const multer = require("multer");
 const fs = require("fs");
 const { execSync } = require("child_process");
-const pdfParse = require("pdf-parse");
+
+// ✅ REPLACED pdf-parse (Render crash) with pdf2json (Render-safe)
+const PDFParser = require("pdf2json");
+
 const tesseract = require("node-tesseract-ocr");
 const PDFDocument = require("pdfkit");
 const helmet = require("helmet");
@@ -104,6 +107,42 @@ function ensureUserUploadDir(userId) {
   const dir = path.join(uploadRoot, `user_${userId}`);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+// =====================
+// PDF TEXT EXTRACTOR (Render-safe)
+// =====================
+function extractPdfText(buffer) {
+  return new Promise((resolve, reject) => {
+    const pdfParser = new PDFParser(null, 1);
+
+    pdfParser.on("pdfParser_dataError", (err) => {
+      reject(err?.parserError || err);
+    });
+
+    pdfParser.on("pdfParser_dataReady", (pdfData) => {
+      try {
+        const pages = pdfData?.Pages || [];
+        const text = pages
+          .map((p) =>
+            (p.Texts || [])
+              .map((t) => {
+                const raw = t?.R?.[0]?.T || "";
+                // pdf2json stores text URL-encoded, plus signs may appear
+                return decodeURIComponent(String(raw).replace(/\+/g, "%20"));
+              })
+              .join(" ")
+          )
+          .join("\n");
+
+        resolve(String(text || "").trim());
+      } catch (e) {
+        reject(e);
+      }
+    });
+
+    pdfParser.parseBuffer(buffer);
+  });
 }
 
 // =====================
@@ -725,9 +764,9 @@ app.post("/api/upload", authMiddleware, upload.single("pdf"), async (req, res) =
 
     let extractedText = "";
     try {
-      const parsed = await pdfParse(buffer);
-      extractedText = (parsed.text || "").trim();
-    } catch {
+      extractedText = await extractPdfText(buffer);
+    } catch (e) {
+      console.log("PDF TEXT EXTRACT ERROR:", e?.message || e);
       extractedText = "";
     }
 
