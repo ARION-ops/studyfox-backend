@@ -34,10 +34,9 @@ app.use(
   })
 );
 
-// ✅ Allow Netlify + everyone for testing/review
 app.use(
   cors({
-    origin: "*",
+    origin: "*", // for review/testing
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
@@ -287,6 +286,30 @@ const upload = multer({
   },
 });
 
+function normalizeText(s) {
+  return String(s || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// extra clean: remove obvious junk lines
+function cleanPdfText(raw) {
+  const t = normalizeText(raw);
+  const lines = t.split("\n").map((l) => l.trim());
+
+  const cleaned = lines
+    .filter((l) => l && l.length >= 3)
+    .filter((l) => !/^page\s*\d+$/i.test(l))
+    .filter((l) => !/copyright|all rights reserved/i.test(l))
+    .filter((l) => !/www\.|http/i.test(l))
+    .join("\n");
+
+  return normalizeText(cleaned);
+}
+
 function extractTextWithPdf2json(filePath) {
   return new Promise((resolve, reject) => {
     const pdfParser = new PDFParser();
@@ -294,7 +317,7 @@ function extractTextWithPdf2json(filePath) {
     pdfParser.on("pdfParser_dataError", (errData) => reject(new Error(errData?.parserError || "PDF read failed")));
     pdfParser.on("pdfParser_dataReady", () => {
       try {
-        const text = String(pdfParser.getRawTextContent() || "").trim();
+        const text = cleanPdfText(pdfParser.getRawTextContent() || "");
         resolve(text);
       } catch (e) {
         reject(e);
@@ -309,8 +332,13 @@ app.post("/api/upload", auth, upload.single("pdf"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const filePath = req.file.path;
-    const extractedText = await extractTextWithPdf2json(filePath);
+    const extractedText = await extractTextWithPdf2json(req.file.path);
+
+    if (!extractedText || extractedText.length < 40) {
+      return res.status(400).json({
+        error: "This PDF has little/no readable text. Try a clearer PDF (text-based), or re-export the file.",
+      });
+    }
 
     db.run(
       "INSERT INTO documents (user_id, title, filename, content) VALUES (?, ?, ?, ?)",
@@ -326,16 +354,8 @@ app.post("/api/upload", auth, upload.single("pdf"), async (req, res) => {
 });
 
 // =====================
-// QUIZ GENERATOR (simple offline)
+// OFFLINE QUIZ GENERATOR (STRONG + NEVER ZERO)
 // =====================
-function normalizeText(s) {
-  return String(s || "")
-    .replace(/\u00a0/g, " ")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 function shuffle(arr) {
   const a = arr.slice();
   for (let i = a.length - 1; i > 0; i--) {
@@ -346,62 +366,191 @@ function shuffle(arr) {
 }
 
 function splitToSentences(text) {
-  const clean = normalizeText(text);
+  const clean = cleanPdfText(text);
   const raw = clean
-    .replace(/\r/g, "")
     .split(/(?<=[.!?])\s+|\n+/g)
     .map((s) => s.trim())
     .filter(Boolean);
 
-  return raw.filter((s) => s.length >= 55 && s.length <= 260);
+  // ✅ Relaxed rules: accept 35..320 chars
+  return raw.filter((s) => s.length >= 35 && s.length <= 320);
 }
 
-function createMcqFromSentence(sentence) {
+function splitToParagraphs(text) {
+  const clean = cleanPdfText(text);
+  return clean
+    .split(/\n{2,}/g)
+    .map((p) => p.trim())
+    .filter((p) => p.length >= 80 && p.length <= 900);
+}
+
+function pickKeyword(sentence) {
   const cleaned = sentence.replace(/[^\w\s-]/g, " ");
   const words = cleaned
     .split(/\s+/)
     .map((w) => w.trim())
     .filter((w) => w.length >= 5 && /^[a-zA-Z-]+$/.test(w));
 
-  if (words.length < 6) return null;
+  // remove weak/common words
+  const stop = new Set([
+    "which","their","there","where","about","these","those","because","before","after",
+    "between","within","without","under","other","using","used","system","systems",
+    "process","processing","information","database","management","design","define",
+    "definition","describe","example","examples","important","different","various",
+    "chapter","course","module","section","student","students"
+  ]);
 
-  const answer = words[Math.floor(Math.random() * words.length)];
-  const question = sentence.replace(new RegExp("\\b" + answer + "\\b"), "_____");
+  const strong = words.filter((w) => !stop.has(w.toLowerCase()));
+  const pool = strong.length >= 4 ? strong : words;
+  if (pool.length < 4) return null;
 
-  const distractorPool = words.filter((w) => w.toLowerCase() !== answer.toLowerCase());
-  const distractors = shuffle(distractorPool).slice(0, 3);
-  while (distractors.length < 3) distractors.push("None of the above");
+  return pool[Math.floor(Math.random() * pool.length)];
+}
 
-  const options = shuffle([answer, ...distractors]);
+function createMcq(sentence, globalPool) {
+  const answer = pickKeyword(sentence);
+  if (!answer) return null;
+
+  // escape regex chars safely
+  const escaped = answer.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const question = sentence.replace(new RegExp(`\\b${escaped}\\b`, "i"), "_____");
+
+  const pool = (globalPool || []).filter((w) => w && w.length >= 5);
+  const distractorPool = pool.filter((w) => w.toLowerCase() !== answer.toLowerCase());
+
+  let distractors = shuffle(distractorPool).filter((w, i, a) => a.findIndex(x => x.toLowerCase()===w.toLowerCase()) === i).slice(0, 3);
+  while (distrorsMissing(distractors)) distractors.push("None of the above");
+
+  const options = shuffle([answer, ...distractors]).slice(0, 4);
   const correctIndex = options.findIndex((o) => o.toLowerCase() === answer.toLowerCase());
 
   return { type: "mcq", question, options, correctIndex };
 }
 
-function generateQuizFromText(text, count = 5) {
-  const sentences = shuffle(splitToSentences(text));
-  const items = [];
-  const seen = new Set();
-
-  for (const s of sentences) {
-    if (items.length >= count) break;
-    const q = createMcqFromSentence(s);
-    if (!q) continue;
-    const key = q.question.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    items.push(q);
-  }
-  return items;
+function distrorsMissing(d) {
+  return (d || []).length < 3;
 }
+
+function buildGlobalWordPool(text) {
+  const cleaned = cleanPdfText(text).replace(/[^\w\s-]/g, " ");
+  const words = cleaned
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 5 && /^[a-zA-Z-]+$/.test(w));
+
+  // unique + shuffle
+  const uniq = [];
+  const seen = new Set();
+  for (const w of words) {
+    const k = w.toLowerCase();
+    if (!seen.has(k)) {
+      seen.add(k);
+      uniq.push(w);
+    }
+  }
+  return shuffle(uniq).slice(0, 300);
+}
+
+function generateQuizFromText(text, count = 5) {
+
+  const clean = String(text || "")
+    .replace(/\n+/g, " ")
+    .replace(/[^\w\s]/g, " ")
+    .trim();
+
+  const words = clean
+    .split(/\s+/)
+    .filter(w => w.length > 4);
+
+  if (words.length < 10) {
+    // fallback generic quiz
+    const fallback = [];
+    for (let i = 0; i < count; i++) {
+      fallback.push({
+        type: "mcq",
+        question: `Based on the document, which term is most relevant?`,
+        options: ["Concept", "Definition", "Process", "Structure"],
+        correctIndex: 0
+      });
+    }
+    return fallback;
+  }
+
+  const quiz = [];
+
+  for (let i = 0; i < count; i++) {
+
+    const answer = words[Math.floor(Math.random() * words.length)];
+
+    const distractors = [];
+
+    while (distractors.length < 3) {
+      const w = words[Math.floor(Math.random() * words.length)];
+      if (w !== answer && !distractors.includes(w)) distractors.push(w);
+    }
+
+    const options = [answer, ...distractors].sort(() => Math.random() - 0.5);
+
+    quiz.push({
+      type: "mcq",
+      question: `Which of the following terms appears in the document content?`,
+      options,
+      correctIndex: options.indexOf(answer)
+    });
+  }
+
+  return quiz;
+}
+  // fallback: paragraphs -> convert to sentence-like chunks
+  if (items.length < count) {
+    const paras = shuffle(splitToParagraphs(cleaned));
+    for (const p of paras) {
+      if (items.length >= count) break;
+      const chunk = p.split(/(?<=[.!?])\s+/).slice(0, 2).join(" ");
+      const q = createMcq(chunk, globalPool);
+      if (!q) continue;
+
+      const key = q.question.toLowerCase();
+      if (seenQ.has(key)) continue;
+      seenQ.add(key);
+      items.push(q);
+    }
+  }
+
+  // last resort: if still short, generate from any lines
+  if (items.length < count) {
+    const lines = shuffle(cleaned.split("\n").map((l) => l.trim()).filter((l) => l.length >= 40 && l.length <= 220));
+    for (const l of lines) {
+      if (items.length >= count) break;
+      const q = createMcq(l, globalPool);
+      if (!q) continue;
+
+      const key = q.question.toLowerCase();
+      if (seenQ.has(key)) continue;
+      seenQ.add(key);
+      items.push(q);
+    }
+  }
+
+  return items.slice(0, count);
+
 
 app.post("/api/quiz/generate", auth, (req, res) => {
   const docId = Number(req.body.docId);
-  const count = Math.max(1, parseInt(req.body.count || 5, 10));
+  const count = Math.max(1, Math.min(50, parseInt(req.body.count || 5, 10)));
 
   db.get("SELECT title, content FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err, row) => {
     if (!row) return res.status(404).json({ error: "Document not found" });
+
     const quiz = generateQuizFromText(row.content || "", count);
+
+    // ✅ NEVER return 0 unless the document truly has no text
+    if (!quiz.length) {
+      return res.status(400).json({
+        error: "Could not generate questions from this PDF text. Try uploading a clearer/text-based PDF.",
+      });
+    }
+
     res.json({ ok: true, poweredBy: "ARION", owner: "Oderinu Marvelous", docTitle: row.title, quiz });
   });
 });
@@ -409,10 +558,16 @@ app.post("/api/quiz/generate", auth, (req, res) => {
 // =====================
 // ATTEMPTS + ANALYTICS
 // =====================
+
+// ✅ SAVE attempt (returns corrections data too)
 app.post("/api/attempts", auth, (req, res) => {
   const docId = Number(req.body.docId);
   const score = Number(req.body.score || 0);
   const total = Number(req.body.total || 0);
+
+  // optional payload for corrections
+  const corrections = Array.isArray(req.body.corrections) ? req.body.corrections : null;
+
   if (!docId || !total) return res.status(400).json({ error: "docId, score, total required" });
 
   const percent = total > 0 ? (score / total) * 100 : 0;
@@ -422,7 +577,16 @@ app.post("/api/attempts", auth, (req, res) => {
     [req.user.id, docId, score, total, percent],
     function (err) {
       if (err) return res.status(500).json({ error: "DB insert error: " + err.message });
-      res.json({ ok: true, attemptId: this.lastID, percent: Math.round(percent) });
+
+      // ✅ return corrections back so frontend can show “Review”
+      res.json({
+        ok: true,
+        attemptId: this.lastID,
+        percent: Math.round(percent),
+        review: corrections
+          ? { available: true, corrections }
+          : { available: false, corrections: [] },
+      });
     }
   );
 });
@@ -507,13 +671,13 @@ app.get("/api/analytics/export", auth, (req, res) => {
 });
 
 // =====================
-// BASIC OFFLINE Q&A (simple paragraph pick)
+// BASIC OFFLINE Q&A
 // =====================
 function cleanLine(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 function splitParagraphs(text) {
-  return normalizeText(text).split(/\n{2,}/g).map(cleanLine).filter(Boolean);
+  return cleanPdfText(text).split(/\n{2,}/g).map(cleanLine).filter(Boolean);
 }
 function wordsFromQuestion(q) {
   return cleanLine(q)
@@ -554,7 +718,7 @@ app.post("/api/qa", auth, (req, res) => {
 });
 
 // =====================
-// ROOT fallback (optional)
+// ROOT fallback
 // =====================
 app.get("/", (req, res) => {
   const indexFile = path.join(FRONTEND_PATH, "index.html");
