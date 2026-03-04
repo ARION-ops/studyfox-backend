@@ -1,25 +1,22 @@
 // ============================================
-// StudyFox Backend - Project 2 (RELEASE BUILD)
+// StudyFox Backend - RELEASE BUILD (FULL API)
 // Powered by ARION
 // Owner: Oderinu Marvelous
 // ============================================
 
+require("dotenv").config();
 const express = require("express");
 const path = require("path");
+const fs = require("fs");
 const crypto = require("crypto");
 const multer = require("multer");
-const fs = require("fs");
-const { execSync } = require("child_process");
-
-// ✅ REPLACED pdf-parse (Render crash) with pdf2json (Render-safe)
-const PDFParser = require("pdf2json");
-
-const tesseract = require("node-tesseract-ocr");
-const PDFDocument = require("pdfkit");
 const helmet = require("helmet");
+const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
 const { body, validationResult } = require("express-validator");
+const PDFParser = require("pdf2json");
+const PDFDocument = require("pdfkit");
 
 const { db, initDb } = require("./db");
 
@@ -28,71 +25,93 @@ const PORT = process.env.PORT || 5050;
 
 app.set("trust proxy", 1);
 
-// ✅ Security headers
+// =====================
+// SECURITY + CORS
+// =====================
 app.use(
   helmet({
-    contentSecurityPolicy: false, // keep simple for local/static frontend
+    contentSecurityPolicy: false,
   })
 );
 
-// ✅ Basic request limit (anti brute-force)
+// ✅ Allow Netlify + everyone for testing/review
 app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    max: 120, // 120 requests/min per IP
-    standardHeaders: true,
-    legacyHeaders: false,
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "DELETE", "PUT", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
 app.use(express.json({ limit: "2mb" }));
 
-// Serve frontend
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+
+// =====================
+// FRONTEND SERVE (optional)
+// =====================
 const FRONTEND_PATH = path.join(__dirname, "..", "frontend");
 app.use(express.static(FRONTEND_PATH));
 
-// Ensure uploads folder
+// =====================
+// UPLOADS
+// =====================
 const uploadRoot = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadRoot)) fs.mkdirSync(uploadRoot, { recursive: true });
 app.use("/uploads", express.static(uploadRoot));
 
-// Init DB
+function ensureUserUploadDir(userId) {
+  const dir = path.join(uploadRoot, `user_${userId}`);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// =====================
+// DATABASE INIT
+// =====================
 initDb();
 
 // =====================
-// AUTH SYSTEM (token sessions in memory)
+// SESSION STORE (Memory tokens)
 // =====================
 const sessions = new Map(); // token -> { user, exp }
-const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
+const SESSION_TTL = 1000 * 60 * 60 * 12; // 12 hours
 
 function makeToken() {
   return crypto.randomBytes(24).toString("hex");
 }
 
 function getToken(req) {
-  const auth = req.headers.authorization || "";
-  if (!auth.startsWith("Bearer ")) return null;
-  return auth.replace("Bearer ", "").trim();
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ")) return null;
+  return authHeader.replace("Bearer ", "").trim();
 }
 
-function authMiddleware(req, res, next) {
+function auth(req, res, next) {
   const token = getToken(req);
   if (!token) return res.status(401).json({ error: "Unauthorized" });
 
-  const sess = sessions.get(token);
-  if (!sess) return res.status(401).json({ error: "Unauthorized" });
+  const session = sessions.get(token);
+  if (!session) return res.status(401).json({ error: "Unauthorized" });
 
-  if (Date.now() > sess.exp) {
+  if (Date.now() > session.exp) {
     sessions.delete(token);
     return res.status(401).json({ error: "Session expired" });
   }
 
-  req.user = sess.user;
+  req.user = session.user;
   req.token = token;
   next();
 }
 
-// cleanup expired sessions occasionally
+// cleanup expired sessions
 setInterval(() => {
   const now = Date.now();
   for (const [t, s] of sessions.entries()) {
@@ -101,86 +120,213 @@ setInterval(() => {
 }, 60 * 1000).unref();
 
 // =====================
-// PER-USER UPLOAD FOLDERS
+// HEALTH
 // =====================
-function ensureUserUploadDir(userId) {
-  const dir = path.join(uploadRoot, `user_${userId}`);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    app: "StudyFox",
+    poweredBy: "ARION",
+    owner: "Oderinu Marvelous",
+  });
+});
 
 // =====================
-// PDF TEXT EXTRACTOR (Render-safe)
+// AUTH
 // =====================
-function extractPdfText(buffer) {
-  return new Promise((resolve, reject) => {
-    const pdfParser = new PDFParser(null, 1);
+app.post(
+  "/api/auth/signup",
+  [
+    body("name").trim().isLength({ min: 2 }).withMessage("Name too short"),
+    body("email").isEmail().withMessage("Invalid email"),
+    body("password").isLength({ min: 4 }).withMessage("Password must be at least 4 characters"),
+  ],
+  (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
-    pdfParser.on("pdfParser_dataError", (err) => {
-      reject(err?.parserError || err);
+    const name = String(req.body.name || "").trim();
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
+
+    db.get("SELECT id FROM users WHERE email = ?", [email], async (err, row) => {
+      if (row) return res.status(400).json({ error: "Email already exists" });
+
+      const hash = await bcrypt.hash(password, 10);
+
+      db.run(
+        "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)",
+        [name, email, hash],
+        function (err2) {
+          if (err2) return res.status(500).json({ error: "Signup failed: " + err2.message });
+
+          const user = { id: this.lastID, name, email };
+          const token = makeToken();
+
+          sessions.set(token, { user, exp: Date.now() + SESSION_TTL });
+          ensureUserUploadDir(user.id);
+
+          res.json({ ok: true, token, user });
+        }
+      );
     });
+  }
+);
 
-    pdfParser.on("pdfParser_dataReady", (pdfData) => {
+app.post(
+  "/api/auth/login",
+  [
+    body("email").isEmail().withMessage("Invalid email"),
+    body("password").isLength({ min: 1 }).withMessage("Password required"),
+  ],
+  (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
+
+    db.get("SELECT id, name, email, password_hash FROM users WHERE email = ?", [email], async (err, row) => {
+      if (!row) return res.status(401).json({ error: "Invalid login" });
+
+      const ok = await bcrypt.compare(password, row.password_hash || "");
+      if (!ok) return res.status(401).json({ error: "Invalid login" });
+
+      const user = { id: row.id, name: row.name, email: row.email };
+      const token = makeToken();
+
+      sessions.set(token, { user, exp: Date.now() + SESSION_TTL });
+      ensureUserUploadDir(user.id);
+
+      res.json({ ok: true, token, user });
+    });
+  }
+);
+
+app.post("/api/auth/logout", auth, (req, res) => {
+  sessions.delete(req.token);
+  res.json({ ok: true });
+});
+
+app.get("/api/me", auth, (req, res) => {
+  res.json(req.user);
+});
+
+// =====================
+// DASHBOARD STATS
+// =====================
+app.get("/api/stats", auth, (req, res) => {
+  db.get("SELECT COUNT(*) AS documents FROM documents WHERE user_id = ?", [req.user.id], (err, docRow) => {
+    db.get(
+      "SELECT COUNT(*) AS quizzes, AVG(percent) AS avgPercent FROM quiz_attempts WHERE user_id = ?",
+      [req.user.id],
+      (err2, qRow) => {
+        res.json({
+          documents: docRow?.documents || 0,
+          quizzes: qRow?.quizzes || 0,
+          avgScore: Math.round(qRow?.avgPercent || 0),
+        });
+      }
+    );
+  });
+});
+
+// =====================
+// LIBRARY
+// =====================
+app.get("/api/library", auth, (req, res) => {
+  db.all(
+    "SELECT id, title, filename, created_at FROM documents WHERE user_id = ? ORDER BY id DESC",
+    [req.user.id],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: "DB error: " + err.message });
+      res.json({ ok: true, documents: rows || [] });
+    }
+  );
+});
+
+app.delete("/api/documents/:id", auth, (req, res) => {
+  const docId = Number(req.params.id);
+
+  db.get("SELECT filename FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err, row) => {
+    if (!row) return res.status(404).json({ error: "Document not found" });
+
+    db.run("DELETE FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err2) => {
+      if (err2) return res.status(500).json({ error: "DB delete error: " + err2.message });
+
       try {
-        const pages = pdfData?.Pages || [];
-        const text = pages
-          .map((p) =>
-            (p.Texts || [])
-              .map((t) => {
-                const raw = t?.R?.[0]?.T || "";
-                // pdf2json stores text URL-encoded, plus signs may appear
-                return decodeURIComponent(String(raw).replace(/\+/g, "%20"));
-              })
-              .join(" ")
-          )
-          .join("\n");
+        const fp = path.join(uploadRoot, `user_${req.user.id}`, row.filename);
+        if (fs.existsSync(fp)) fs.unlinkSync(fp);
+      } catch (_) {}
 
-        resolve(String(text || "").trim());
+      res.json({ ok: true });
+    });
+  });
+});
+
+// =====================
+// PDF UPLOAD (Render-safe) - per user folder
+// =====================
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const userId = req.user?.id;
+      if (!userId) return cb(new Error("Unauthorized upload"));
+      cb(null, ensureUserUploadDir(userId));
+    },
+    filename: (req, file, cb) => {
+      const safe = String(file.originalname || "document.pdf").replace(/\s+/g, "_");
+      cb(null, Date.now() + "-" + safe);
+    },
+  }),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = file.mimetype === "application/pdf" || file.originalname.toLowerCase().endsWith(".pdf");
+    if (!ok) return cb(new Error("Only PDF files are allowed"));
+    cb(null, true);
+  },
+});
+
+function extractTextWithPdf2json(filePath) {
+  return new Promise((resolve, reject) => {
+    const pdfParser = new PDFParser();
+
+    pdfParser.on("pdfParser_dataError", (errData) => reject(new Error(errData?.parserError || "PDF read failed")));
+    pdfParser.on("pdfParser_dataReady", () => {
+      try {
+        const text = String(pdfParser.getRawTextContent() || "").trim();
+        resolve(text);
       } catch (e) {
         reject(e);
       }
     });
 
-    pdfParser.parseBuffer(buffer);
+    pdfParser.loadPDF(filePath);
   });
 }
 
-// =====================
-// OCR HELPER (LIMITED PAGES FOR SPEED)
-// =====================
-async function ocrPdfToText(pdfPath) {
-  const tempDir = path.join(__dirname, "tmp_ocr_" + Date.now());
-  fs.mkdirSync(tempDir);
+app.post("/api/upload", auth, upload.single("pdf"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-  const outputPrefix = path.join(tempDir, "page");
-  // ✅ limit OCR to first 8 pages for speed
-  execSync(`pdftoppm -png -r 180 -f 1 -l 8 "${pdfPath}" "${outputPrefix}"`);
+    const filePath = req.file.path;
+    const extractedText = await extractTextWithPdf2json(filePath);
 
-  const images = fs
-    .readdirSync(tempDir)
-    .filter((f) => f.endsWith(".png"))
-    .map((f) => path.join(tempDir, f));
-
-  let fullText = "";
-  for (const img of images) {
-    try {
-      const text = await tesseract.recognize(img, {
-        lang: "eng",
-        oem: 1,
-        psm: 3,
-      });
-      fullText += "\n" + text;
-    } catch (e) {
-      console.error("OCR PAGE ERROR:", e.message);
-    }
+    db.run(
+      "INSERT INTO documents (user_id, title, filename, content) VALUES (?, ?, ?, ?)",
+      [req.user.id, req.file.originalname, req.file.filename, extractedText],
+      function (err) {
+        if (err) return res.status(500).json({ error: "DB insert failed: " + err.message });
+        res.json({ ok: true, docId: this.lastID });
+      }
+    );
+  } catch (e) {
+    res.status(500).json({ error: "Upload failed: " + e.message });
   }
-
-  fs.rmSync(tempDir, { recursive: true, force: true });
-  return fullText.trim();
-}
+});
 
 // =====================
-// QUIZ GENERATOR (OFFLINE)
+// QUIZ GENERATOR (simple offline)
 // =====================
 function normalizeText(s) {
   return String(s || "")
@@ -207,14 +353,7 @@ function splitToSentences(text) {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  return raw.filter((s) => {
-    if (s.length < 55) return false;
-    if (s.length > 260) return false;
-    if (/^page\s+\d+$/i.test(s)) return false;
-    if (/copyright|all rights reserved|www\.|http/i.test(s)) return false;
-    if (/^\s*(describe|explain|discuss|outline)\b/i.test(s)) return false;
-    return true;
-  });
+  return raw.filter((s) => s.length >= 55 && s.length <= 260);
 }
 
 function createMcqFromSentence(sentence) {
@@ -226,54 +365,11 @@ function createMcqFromSentence(sentence) {
 
   if (words.length < 6) return null;
 
-  const stop = new Set([
-    "which",
-    "their",
-    "there",
-    "where",
-    "about",
-    "these",
-    "those",
-    "because",
-    "before",
-    "after",
-    "between",
-    "within",
-    "without",
-    "under",
-    "other",
-    "using",
-    "used",
-    "useful",
-    "system",
-    "systems",
-    "process",
-    "processing",
-    "information",
-    "database",
-    "management",
-    "design",
-    "define",
-    "definition",
-    "describe",
-    "example",
-    "examples",
-  ]);
-
-  const candidates = words.filter((w) => !stop.has(w.toLowerCase()));
-  const pool = candidates.length >= 4 ? candidates : words;
-
-  const answer = pool[Math.floor(Math.random() * pool.length)];
+  const answer = words[Math.floor(Math.random() * words.length)];
   const question = sentence.replace(new RegExp("\\b" + answer + "\\b"), "_____");
 
-  const distractorPool = pool.filter((w) => w.toLowerCase() !== answer.toLowerCase());
-  const distractors = [];
-  const mixed = shuffle(distractorPool);
-
-  for (const w of mixed) {
-    if (distractors.length >= 3) break;
-    if (!distractors.some((x) => x.toLowerCase() === w.toLowerCase())) distractors.push(w);
-  }
+  const distractorPool = words.filter((w) => w.toLowerCase() !== answer.toLowerCase());
+  const distractors = shuffle(distractorPool).slice(0, 3);
   while (distractors.length < 3) distractors.push("None of the above");
 
   const options = shuffle([answer, ...distractors]);
@@ -283,348 +379,55 @@ function createMcqFromSentence(sentence) {
 }
 
 function generateQuizFromText(text, count = 5) {
-  const sentences = splitToSentences(text);
-  if (!sentences.length) return [];
-
-  const sents = shuffle(sentences);
+  const sentences = shuffle(splitToSentences(text));
   const items = [];
-  const seenQ = new Set();
+  const seen = new Set();
 
-  for (const s of sents) {
+  for (const s of sentences) {
     if (items.length >= count) break;
-    const mcq = createMcqFromSentence(s);
-    if (!mcq) continue;
-
-    const key = mcq.question.toLowerCase();
-    if (seenQ.has(key)) continue;
-
-    seenQ.add(key);
-    items.push(mcq);
+    const q = createMcqFromSentence(s);
+    if (!q) continue;
+    const key = q.question.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push(q);
   }
-
-  let guard = 0;
-  while (items.length < count && guard < count * 50) {
-    const s = sents[Math.floor(Math.random() * sents.length)];
-    const mcq = createMcqFromSentence(s);
-    guard++;
-    if (!mcq) continue;
-
-    const key = mcq.question.toLowerCase();
-    if (seenQ.has(key)) continue;
-
-    seenQ.add(key);
-    items.push(mcq);
-  }
-
   return items;
 }
 
-// =====================
-// OFFLINE TUTOR (BETTER ANSWERS)
-// =====================
-function cleanLine(s) {
-  return String(s || "")
-    .replace(/^[•\-\–\—\*]+\s*/g, "")
-    .replace(/^[¢§»]+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-function isGarbageLine(s) {
-  const t = cleanLine(s).toLowerCase();
-  if (!t) return true;
-  if (t.length < 25) return true;
-  if (/^\s*(describe|discuss|outline|explain|list|state|identify)\b/.test(t)) return true;
-  if (t.includes("learning outcomes")) return true;
-  if (t.includes("focus:")) return true;
-  if (t.includes("module")) return true;
-  if (t.includes("course")) return true;
-  if (/^page\s+\d+/.test(t)) return true;
-  if (t.includes("copyright")) return true;
-  return false;
-}
-function wordsFromQuestion(q) {
-  return cleanLine(q)
-    .toLowerCase()
-    .split(/[^a-z0-9]+/g)
-    .filter(
-      (w) =>
-        w.length >= 3 &&
-        ![
-          "what",
-          "when",
-          "where",
-          "which",
-          "that",
-          "this",
-          "with",
-          "from",
-          "into",
-          "your",
-          "their",
-          "they",
-          "them",
-          "have",
-          "has",
-          "had",
-          "will",
-          "would",
-          "should",
-          "could",
-          "about",
-          "also",
-          "very",
-          "like",
-          "give",
-          "tell",
-          "define",
-          "definition",
-          "explain",
-        ].includes(w)
-    );
-}
-function splitParagraphs(text) {
-  return normalizeText(text)
-    .split(/\n{2,}/g)
-    .map((p) => cleanLine(p))
-    .filter(Boolean);
-}
-function scoreParagraph(p, keys) {
-  const lower = p.toLowerCase();
-  let score = 0;
-  for (const k of keys) if (lower.includes(k)) score += 3;
-  if (/(is defined as|refers to|means|can be defined as|is a|are a)/i.test(p)) score += 4;
-  if (/^\s*(describe|explain|discuss|outline)\b/i.test(p)) score -= 4;
-  if (p.includes("Focus:")) score -= 3;
-  if (p.length >= 80 && p.length <= 650) score += 2;
-  return score;
-}
-function pickBestText(content, question) {
-  const keys = wordsFromQuestion(question);
-  const paras = splitParagraphs(content).filter((p) => !isGarbageLine(p));
-  if (!paras.length) return { keys, picks: [] };
+app.post("/api/quiz/generate", auth, (req, res) => {
+  const docId = Number(req.body.docId);
+  const count = Math.max(1, parseInt(req.body.count || 5, 10));
 
-  const ranked = paras
-    .map((p) => ({ p, s: scoreParagraph(p, keys) }))
-    .sort((a, b) => b.s - a.s);
-
-  const best = ranked.filter((x) => x.s > 0).slice(0, 4).map((x) => x.p);
-  return { keys, picks: best.length ? best : paras.slice(0, 3) };
-}
-function pickSentences(block) {
-  const sentences = cleanLine(block)
-    .split(/(?<=[.?!])\s+/)
-    .map(cleanLine)
-    .filter((s) => s.length >= 30 && s.length <= 260)
-    .filter((s) => !isGarbageLine(s));
-
-  const seen = new Set();
-  const out = [];
-  for (const s of sentences) {
-    const key = s.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(s);
-  }
-  return out;
-}
-function buildHumanAnswer(question, picks, keys) {
-  if (!picks.length) {
-    return { answer: "I couldn't find readable text in this document to answer that.", evidence: "" };
-  }
-
-  const combined = picks.join("\n\n");
-  const sentences = pickSentences(combined);
-
-  const defLine =
-    sentences.find((s) => /(is defined as|refers to|means|can be defined as|is a|are a)/i.test(s) && s.length <= 240) ||
-    sentences[0] ||
-    combined.slice(0, 220);
-
-  const scored = sentences
-    .map((s) => {
-      const l = s.toLowerCase();
-      let sc = 0;
-      for (const k of keys) if (l.includes(k)) sc += 2;
-      if (/(important|key|feature|used for|supports|enables|helps|allows)/i.test(s)) sc += 1;
-      return { s, sc };
-    })
-    .sort((a, b) => b.sc - a.sc);
-
-  const points = scored.filter((x) => x.sc > 0).slice(0, 4).map((x) => x.s);
-  const usePoints = points.length ? points : sentences.slice(1, 5);
-
-  const lines = [];
-  lines.push(`**${cleanLine(question)}**\n`);
-  lines.push(`${cleanLine(defLine)}\n`);
-  lines.push(`**Key points:**`);
-  usePoints.slice(0, 4).forEach((p) => lines.push(`• ${cleanLine(p)}`));
-  lines.push(`\n**In short:** ${cleanLine(defLine).slice(0, 220)}`);
-
-  return { answer: lines.join("\n"), evidence: combined.slice(0, 900) };
-}
-
-// =====================
-// FILE UPLOAD (PDF only, size limit)
-// =====================
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => {
-      const userId = req.user?.id;
-      if (!userId) return cb(new Error("Unauthorized upload"));
-      cb(null, ensureUserUploadDir(userId));
-    },
-    filename: (req, file, cb) => {
-      const safe = String(file.originalname || "document.pdf").replace(/\s+/g, "_");
-      cb(null, Date.now() + "-" + safe);
-    },
-  }),
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
-  fileFilter: (req, file, cb) => {
-    const ok = file.mimetype === "application/pdf" || file.originalname.toLowerCase().endsWith(".pdf");
-    if (!ok) return cb(new Error("Only PDF files are allowed"));
-    cb(null, true);
-  },
-});
-
-// =====================
-// ROUTES
-// =====================
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    app: "StudyFox",
-    poweredBy: "ARION",
-    owner: "Oderinu Marvelous",
-    frontendPath: FRONTEND_PATH,
+  db.get("SELECT title, content FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err, row) => {
+    if (!row) return res.status(404).json({ error: "Document not found" });
+    const quiz = generateQuizFromText(row.content || "", count);
+    res.json({ ok: true, poweredBy: "ARION", owner: "Oderinu Marvelous", docTitle: row.title, quiz });
   });
 });
 
-// ---- Signup ----
-app.post(
-  "/api/auth/signup",
-  [
-    body("name").trim().isLength({ min: 2 }).withMessage("Name too short"),
-    body("email").isEmail().withMessage("Invalid email"),
-    body("password").isLength({ min: 4 }).withMessage("Password must be at least 4 characters"),
-  ],
-  (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+// =====================
+// ATTEMPTS + ANALYTICS
+// =====================
+app.post("/api/attempts", auth, (req, res) => {
+  const docId = Number(req.body.docId);
+  const score = Number(req.body.score || 0);
+  const total = Number(req.body.total || 0);
+  if (!docId || !total) return res.status(400).json({ error: "docId, score, total required" });
 
-    const name = String(req.body.name || "").trim();
-    const email = String(req.body.email || "").trim().toLowerCase();
-    const password = String(req.body.password || "");
+  const percent = total > 0 ? (score / total) * 100 : 0;
 
-    db.get("SELECT id FROM users WHERE email = ?", [email], async (err, row) => {
-      if (row) return res.status(400).json({ error: "Email already exists" });
-
-      const password_hash = await bcrypt.hash(password, 10);
-
-      db.run(
-        "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)",
-        [name, email, password_hash],
-        function (err2) {
-          if (err2) return res.status(500).json({ error: "Signup failed: " + err2.message });
-
-          const user = { id: this.lastID, name, email };
-          const token = makeToken();
-          sessions.set(token, { user, exp: Date.now() + SESSION_TTL_MS });
-
-          ensureUserUploadDir(user.id);
-          res.json({ ok: true, token, user });
-        }
-      );
-    });
-  }
-);
-
-// ---- Login ----
-app.post(
-  "/api/auth/login",
-  [body("email").isEmail().withMessage("Invalid email"), body("password").isLength({ min: 1 }).withMessage("Password required")],
-  (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
-
-    const email = String(req.body.email || "").trim().toLowerCase();
-    const password = String(req.body.password || "");
-
-    db.get("SELECT id, name, email, password_hash FROM users WHERE email = ?", [email], async (err, row) => {
-      if (!row) return res.status(401).json({ error: "Invalid login" });
-
-      const ok = await bcrypt.compare(password, row.password_hash || "");
-      if (!ok) return res.status(401).json({ error: "Invalid login" });
-
-      const user = { id: row.id, name: row.name, email: row.email };
-      const token = makeToken();
-      sessions.set(token, { user, exp: Date.now() + SESSION_TTL_MS });
-
-      ensureUserUploadDir(user.id);
-      res.json({ ok: true, token, user });
-    });
-  }
-);
-
-app.post("/api/auth/logout", authMiddleware, (req, res) => {
-  sessions.delete(req.token);
-  res.json({ ok: true });
-});
-
-app.get("/api/me", authMiddleware, (req, res) => {
-  res.json(req.user);
-});
-
-// ---- Dashboard stats ----
-app.get("/api/stats", authMiddleware, (req, res) => {
-  db.get("SELECT COUNT(*) AS documents FROM documents WHERE user_id = ?", [req.user.id], (err, docRow) => {
-    db.get(
-      "SELECT COUNT(*) AS quizzes, AVG(percent) AS avgPercent FROM quiz_attempts WHERE user_id = ?",
-      [req.user.id],
-      (err2, qRow) => {
-        res.json({
-          documents: docRow?.documents || 0,
-          quizzes: qRow?.quizzes || 0,
-          avgScore: Math.round(qRow?.avgPercent || 0),
-        });
-      }
-    );
-  });
-});
-
-// ---- Library list ----
-app.get("/api/library", authMiddleware, (req, res) => {
-  db.all(
-    "SELECT id, title, filename, created_at FROM documents WHERE user_id = ? ORDER BY id DESC",
-    [req.user.id],
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: "DB error: " + err.message });
-      res.json({ ok: true, documents: rows || [] });
+  db.run(
+    "INSERT INTO quiz_attempts (user_id, doc_id, score, total, percent) VALUES (?, ?, ?, ?, ?)",
+    [req.user.id, docId, score, total, percent],
+    function (err) {
+      if (err) return res.status(500).json({ error: "DB insert error: " + err.message });
+      res.json({ ok: true, attemptId: this.lastID, percent: Math.round(percent) });
     }
   );
 });
 
-// ---- Delete document (also delete file) ----
-app.delete("/api/documents/:id", authMiddleware, (req, res) => {
-  const docId = Number(req.params.id);
-
-  db.get("SELECT filename FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err, row) => {
-    if (!row) return res.status(404).json({ error: "Document not found" });
-
-    db.run("DELETE FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err2) => {
-      if (err2) return res.status(500).json({ error: "DB delete error: " + err2.message });
-
-      try {
-        const fp = path.join(uploadRoot, `user_${req.user.id}`, row.filename);
-        if (fs.existsSync(fp)) fs.unlinkSync(fp);
-      } catch (_) {}
-
-      res.json({ ok: true });
-    });
-  });
-});
-
-// ---- Analytics summary ----
-app.get("/api/analytics/summary", authMiddleware, (req, res) => {
+app.get("/api/analytics/summary", auth, (req, res) => {
   db.get(
     "SELECT COUNT(*) AS totalAttempts, AVG(percent) AS avgPercent, MAX(percent) AS bestPercent FROM quiz_attempts WHERE user_id = ?",
     [req.user.id],
@@ -639,7 +442,7 @@ app.get("/api/analytics/summary", authMiddleware, (req, res) => {
   );
 });
 
-app.get("/api/analytics/attempts", authMiddleware, (req, res) => {
+app.get("/api/analytics/attempts", auth, (req, res) => {
   const limit = Math.max(5, Math.min(200, parseInt(req.query.limit || "30", 10)));
   db.all(
     "SELECT score, total, percent, created_at FROM quiz_attempts WHERE user_id = ? ORDER BY id DESC LIMIT ?",
@@ -651,8 +454,7 @@ app.get("/api/analytics/attempts", authMiddleware, (req, res) => {
   );
 });
 
-// ---- Export analytics PDF ----
-app.get("/api/analytics/export", authMiddleware, (req, res) => {
+app.get("/api/analytics/export", auth, (req, res) => {
   db.all(
     "SELECT percent, score, total, created_at FROM quiz_attempts WHERE user_id = ? ORDER BY id DESC LIMIT 50",
     [req.user.id],
@@ -704,96 +506,73 @@ app.get("/api/analytics/export", authMiddleware, (req, res) => {
   );
 });
 
-// ---- Save attempt ----
-app.post("/api/attempts", authMiddleware, (req, res) => {
-  const docId = Number(req.body.docId);
-  const score = Number(req.body.score || 0);
-  const total = Number(req.body.total || 0);
+// =====================
+// BASIC OFFLINE Q&A (simple paragraph pick)
+// =====================
+function cleanLine(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+function splitParagraphs(text) {
+  return normalizeText(text).split(/\n{2,}/g).map(cleanLine).filter(Boolean);
+}
+function wordsFromQuestion(q) {
+  return cleanLine(q)
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .filter((w) => w.length >= 3 && !["what", "when", "where", "which", "that", "this", "with", "from", "into", "your"].includes(w));
+}
+function scoreParagraph(p, keys) {
+  const lower = p.toLowerCase();
+  let score = 0;
+  for (const k of keys) if (lower.includes(k)) score += 3;
+  if (/(is defined as|refers to|means|can be defined as|is a|are a)/i.test(p)) score += 2;
+  return score;
+}
 
-  if (!docId || !total) return res.status(400).json({ error: "docId, score, total required" });
-
-  const percent = total > 0 ? (score / total) * 100 : 0;
-
-  db.run(
-    "INSERT INTO quiz_attempts (user_id, doc_id, score, total, percent) VALUES (?, ?, ?, ?, ?)",
-    [req.user.id, docId, score, total, percent],
-    function (err) {
-      if (err) return res.status(500).json({ error: "DB insert error: " + err.message });
-      res.json({ ok: true, attemptId: this.lastID, percent: Math.round(percent) });
-    }
-  );
-});
-
-// ---- Generate quiz ----
-app.post("/api/quiz/generate", authMiddleware, (req, res) => {
-  const docId = Number(req.body.docId);
-  const count = Math.max(1, parseInt(req.body.count || 5, 10));
-
-  db.get(
-    "SELECT title, content FROM documents WHERE id = ? AND user_id = ?",
-    [docId, req.user.id],
-    (err, row) => {
-      if (!row) return res.status(404).json({ error: "Document not found" });
-      const quiz = generateQuizFromText(row.content || "", count);
-      res.json({ ok: true, poweredBy: "ARION", owner: "Oderinu Marvelous", docTitle: row.title, quiz });
-    }
-  );
-});
-
-// ---- Tutor Q&A ----
-app.post("/api/qa", authMiddleware, (req, res) => {
+app.post("/api/qa", auth, (req, res) => {
   const docId = Number(req.body.docId);
   const question = String(req.body.question || "").trim();
   if (!docId || !question) return res.status(400).json({ error: "docId and question required" });
 
   db.get("SELECT content FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err, row) => {
     if (!row) return res.status(404).json({ error: "Document not found" });
-    const { keys, picks } = pickBestText(row.content || "", question);
-    res.json(buildHumanAnswer(question, picks, keys));
+
+    const keys = wordsFromQuestion(question);
+    const paras = splitParagraphs(row.content || "");
+    if (!paras.length) return res.json({ answer: "No readable text found in this document.", evidence: "" });
+
+    const ranked = paras
+      .map((p) => ({ p, s: scoreParagraph(p, keys) }))
+      .sort((a, b) => b.s - a.s);
+
+    const best = ranked[0]?.p || paras[0];
+    res.json({
+      answer: `**${cleanLine(question)}**\n\n${best}`,
+      evidence: best.slice(0, 900),
+    });
   });
 });
 
-// ---- Upload + extract ----
-app.post("/api/upload", authMiddleware, upload.single("pdf"), async (req, res) => {
-  try {
-    const file = req.file;
-    if (!file) return res.status(400).json({ error: "No file uploaded" });
-
-    const filePath = file.path;
-    const buffer = fs.readFileSync(filePath);
-
-    let extractedText = "";
-    try {
-      extractedText = await extractPdfText(buffer);
-    } catch (e) {
-      console.log("PDF TEXT EXTRACT ERROR:", e?.message || e);
-      extractedText = "";
-    }
-
-    if (!extractedText || extractedText.length < 20) {
-      console.log("⚠️ No readable text found. Running OCR fallback...");
-      extractedText = await ocrPdfToText(filePath);
-    }
-
-    db.run(
-      "INSERT INTO documents (user_id, title, filename, content) VALUES (?, ?, ?, ?)",
-      [req.user.id, file.originalname, file.filename, extractedText],
-      function (err) {
-        if (err) return res.status(500).json({ error: "DB insert error: " + err.message });
-        res.json({ ok: true, docId: this.lastID });
-      }
-    );
-  } catch (e) {
-    res.status(500).json({ error: "Server error: " + e.message });
-  }
+// =====================
+// ROOT fallback (optional)
+// =====================
+app.get("/", (req, res) => {
+  const indexFile = path.join(FRONTEND_PATH, "index.html");
+  if (fs.existsSync(indexFile)) return res.sendFile(indexFile);
+  res.send("StudyFox backend is live ✅");
 });
 
-// Global error handler (multer + others)
+// =====================
+// ERROR HANDLER
+// =====================
 app.use((err, req, res, next) => {
   console.error("SERVER ERROR:", err.message);
   res.status(400).json({ error: err.message || "Request failed" });
 });
 
+// =====================
+// START
+// =====================
 app.listen(PORT, () => {
   console.log(`✅ StudyFox running on http://127.0.0.1:${PORT}`);
   console.log(`⚡ Powered by ARION`);
