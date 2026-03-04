@@ -36,7 +36,7 @@ app.use(
 
 app.use(
   cors({
-    origin: "*", // for review/testing
+    origin: "*", // review/testing
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
@@ -119,6 +119,41 @@ setInterval(() => {
 }, 60 * 1000).unref();
 
 // =====================
+// HELPERS (TEXT CLEANING)
+// =====================
+function normalizeText(s) {
+  return String(s || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function cleanPdfText(raw) {
+  const t = normalizeText(raw);
+  const lines = t.split("\n").map((l) => l.trim());
+
+  const cleaned = lines
+    .filter((l) => l && l.length >= 2)
+    .filter((l) => !/^page\s*\d+$/i.test(l))
+    .filter((l) => !/copyright|all rights reserved/i.test(l))
+    .filter((l) => !/www\.|http/i.test(l))
+    .join("\n");
+
+  return normalizeText(cleaned);
+}
+
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// =====================
 // HEALTH
 // =====================
 app.get("/api/health", (req, res) => {
@@ -138,11 +173,14 @@ app.post(
   [
     body("name").trim().isLength({ min: 2 }).withMessage("Name too short"),
     body("email").isEmail().withMessage("Invalid email"),
-    body("password").isLength({ min: 4 }).withMessage("Password must be at least 4 characters"),
+    body("password")
+      .isLength({ min: 4 })
+      .withMessage("Password must be at least 4 characters"),
   ],
   (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+    if (!errors.isEmpty())
+      return res.status(400).json({ error: errors.array()[0].msg });
 
     const name = String(req.body.name || "").trim();
     const email = String(req.body.email || "").trim().toLowerCase();
@@ -157,7 +195,8 @@ app.post(
         "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)",
         [name, email, hash],
         function (err2) {
-          if (err2) return res.status(500).json({ error: "Signup failed: " + err2.message });
+          if (err2)
+            return res.status(500).json({ error: "Signup failed: " + err2.message });
 
           const user = { id: this.lastID, name, email };
           const token = makeToken();
@@ -180,25 +219,30 @@ app.post(
   ],
   (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+    if (!errors.isEmpty())
+      return res.status(400).json({ error: errors.array()[0].msg });
 
     const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
 
-    db.get("SELECT id, name, email, password_hash FROM users WHERE email = ?", [email], async (err, row) => {
-      if (!row) return res.status(401).json({ error: "Invalid login" });
+    db.get(
+      "SELECT id, name, email, password_hash FROM users WHERE email = ?",
+      [email],
+      async (err, row) => {
+        if (!row) return res.status(401).json({ error: "Invalid login" });
 
-      const ok = await bcrypt.compare(password, row.password_hash || "");
-      if (!ok) return res.status(401).json({ error: "Invalid login" });
+        const ok = await bcrypt.compare(password, row.password_hash || "");
+        if (!ok) return res.status(401).json({ error: "Invalid login" });
 
-      const user = { id: row.id, name: row.name, email: row.email };
-      const token = makeToken();
+        const user = { id: row.id, name: row.name, email: row.email };
+        const token = makeToken();
 
-      sessions.set(token, { user, exp: Date.now() + SESSION_TTL });
-      ensureUserUploadDir(user.id);
+        sessions.set(token, { user, exp: Date.now() + SESSION_TTL });
+        ensureUserUploadDir(user.id);
 
-      res.json({ ok: true, token, user });
-    });
+        res.json({ ok: true, token, user });
+      }
+    );
   }
 );
 
@@ -215,19 +259,23 @@ app.get("/api/me", auth, (req, res) => {
 // DASHBOARD STATS
 // =====================
 app.get("/api/stats", auth, (req, res) => {
-  db.get("SELECT COUNT(*) AS documents FROM documents WHERE user_id = ?", [req.user.id], (err, docRow) => {
-    db.get(
-      "SELECT COUNT(*) AS quizzes, AVG(percent) AS avgPercent FROM quiz_attempts WHERE user_id = ?",
-      [req.user.id],
-      (err2, qRow) => {
-        res.json({
-          documents: docRow?.documents || 0,
-          quizzes: qRow?.quizzes || 0,
-          avgScore: Math.round(qRow?.avgPercent || 0),
-        });
-      }
-    );
-  });
+  db.get(
+    "SELECT COUNT(*) AS documents FROM documents WHERE user_id = ?",
+    [req.user.id],
+    (err, docRow) => {
+      db.get(
+        "SELECT COUNT(*) AS quizzes, AVG(percent) AS avgPercent FROM quiz_attempts WHERE user_id = ?",
+        [req.user.id],
+        (err2, qRow) => {
+          res.json({
+            documents: docRow?.documents || 0,
+            quizzes: qRow?.quizzes || 0,
+            avgScore: Math.round(qRow?.avgPercent || 0),
+          });
+        }
+      );
+    }
+  );
 });
 
 // =====================
@@ -247,20 +295,31 @@ app.get("/api/library", auth, (req, res) => {
 app.delete("/api/documents/:id", auth, (req, res) => {
   const docId = Number(req.params.id);
 
-  db.get("SELECT filename FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err, row) => {
-    if (!row) return res.status(404).json({ error: "Document not found" });
+  db.get(
+    "SELECT filename FROM documents WHERE id = ? AND user_id = ?",
+    [docId, req.user.id],
+    (err, row) => {
+      if (!row) return res.status(404).json({ error: "Document not found" });
 
-    db.run("DELETE FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err2) => {
-      if (err2) return res.status(500).json({ error: "DB delete error: " + err2.message });
+      db.run(
+        "DELETE FROM documents WHERE id = ? AND user_id = ?",
+        [docId, req.user.id],
+        (err2) => {
+          if (err2)
+            return res
+              .status(500)
+              .json({ error: "DB delete error: " + err2.message });
 
-      try {
-        const fp = path.join(uploadRoot, `user_${req.user.id}`, row.filename);
-        if (fs.existsSync(fp)) fs.unlinkSync(fp);
-      } catch (_) {}
+          try {
+            const fp = path.join(uploadRoot, `user_${req.user.id}`, row.filename);
+            if (fs.existsSync(fp)) fs.unlinkSync(fp);
+          } catch (_) {}
 
-      res.json({ ok: true });
-    });
-  });
+          res.json({ ok: true });
+        }
+      );
+    }
+  );
 });
 
 // =====================
@@ -280,41 +339,22 @@ const upload = multer({
   }),
   limits: { fileSize: 15 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const ok = file.mimetype === "application/pdf" || file.originalname.toLowerCase().endsWith(".pdf");
+    const ok =
+      file.mimetype === "application/pdf" ||
+      file.originalname.toLowerCase().endsWith(".pdf");
     if (!ok) return cb(new Error("Only PDF files are allowed"));
     cb(null, true);
   },
 });
 
-function normalizeText(s) {
-  return String(s || "")
-    .replace(/\u00a0/g, " ")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\r/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-// extra clean: remove obvious junk lines
-function cleanPdfText(raw) {
-  const t = normalizeText(raw);
-  const lines = t.split("\n").map((l) => l.trim());
-
-  const cleaned = lines
-    .filter((l) => l && l.length >= 3)
-    .filter((l) => !/^page\s*\d+$/i.test(l))
-    .filter((l) => !/copyright|all rights reserved/i.test(l))
-    .filter((l) => !/www\.|http/i.test(l))
-    .join("\n");
-
-  return normalizeText(cleaned);
-}
-
 function extractTextWithPdf2json(filePath) {
   return new Promise((resolve, reject) => {
     const pdfParser = new PDFParser();
 
-    pdfParser.on("pdfParser_dataError", (errData) => reject(new Error(errData?.parserError || "PDF read failed")));
+    pdfParser.on("pdfParser_dataError", (errData) =>
+      reject(new Error(errData?.parserError || "PDF read failed"))
+    );
+
     pdfParser.on("pdfParser_dataReady", () => {
       try {
         const text = cleanPdfText(pdfParser.getRawTextContent() || "");
@@ -334,10 +374,22 @@ app.post("/api/upload", auth, upload.single("pdf"), async (req, res) => {
 
     const extractedText = await extractTextWithPdf2json(req.file.path);
 
-    if (!extractedText || extractedText.length < 40) {
-      return res.status(400).json({
-        error: "This PDF has little/no readable text. Try a clearer PDF (text-based), or re-export the file.",
-      });
+    if (!extractedText || extractedText.length < 20) {
+      // still allow saving, but warn (so quiz can fallback)
+      db.run(
+        "INSERT INTO documents (user_id, title, filename, content) VALUES (?, ?, ?, ?)",
+        [req.user.id, req.file.originalname, req.file.filename, extractedText || ""],
+        function (err) {
+          if (err) return res.status(500).json({ error: "DB insert failed: " + err.message });
+          res.json({
+            ok: true,
+            docId: this.lastID,
+            warning:
+              "This PDF has very little readable text. Quiz will use fallback questions. Try a text-based PDF for better results.",
+          });
+        }
+      );
+      return;
     }
 
     db.run(
@@ -354,221 +406,169 @@ app.post("/api/upload", auth, upload.single("pdf"), async (req, res) => {
 });
 
 // =====================
-// OFFLINE QUIZ GENERATOR (STRONG + NEVER ZERO)
+// OFFLINE MCQ GENERATOR (STRONG + NEVER ZERO)
 // =====================
-function shuffle(arr) {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
+function tokenizeWords(text) {
+  const cleaned = cleanPdfText(text)
+    .replace(/[^\w\s-]/g, " ")
+    .replace(/\n+/g, " ")
+    .toLowerCase();
+
+  const words = cleaned
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 5 && /^[a-z0-9-]+$/.test(w));
+
+  // unique keep order-ish
+  const seen = new Set();
+  const uniq = [];
+  for (const w of words) {
+    if (!seen.has(w)) {
+      seen.add(w);
+      uniq.push(w);
+    }
   }
-  return a;
+  return uniq;
 }
 
-function splitToSentences(text) {
+function splitSentences(text) {
   const clean = cleanPdfText(text);
   const raw = clean
     .split(/(?<=[.!?])\s+|\n+/g)
     .map((s) => s.trim())
     .filter(Boolean);
 
-  // ✅ Relaxed rules: accept 35..320 chars
-  return raw.filter((s) => s.length >= 35 && s.length <= 320);
+  // relaxed: accept more
+  return raw.filter((s) => s.length >= 30 && s.length <= 340);
 }
 
-function splitToParagraphs(text) {
-  const clean = cleanPdfText(text);
-  return clean
-    .split(/\n{2,}/g)
-    .map((p) => p.trim())
-    .filter((p) => p.length >= 80 && p.length <= 900);
+function buildFallbackQuestions(count) {
+  const template = [
+    {
+      question: "Which of the following best describes the main topic of this document?",
+      options: ["Concept", "Process", "System", "Structure"],
+      correctIndex: 0,
+    },
+    {
+      question: "Which option is most likely a key term in the document?",
+      options: ["Definition", "Method", "Model", "Framework"],
+      correctIndex: 3,
+    },
+    {
+      question: "Which statement is most suitable as a summary of a section of the document?",
+      options: ["It explains a concept", "It lists random words", "It is unrelated", "It contains only images"],
+      correctIndex: 0,
+    },
+  ];
+
+  const out = [];
+  for (let i = 0; i < count; i++) out.push(template[i % template.length]);
+  return out.map((q) => ({ type: "mcq", ...q }));
 }
 
-function pickKeyword(sentence) {
-  const cleaned = sentence.replace(/[^\w\s-]/g, " ");
-  const words = cleaned
-    .split(/\s+/)
-    .map((w) => w.trim())
-    .filter((w) => w.length >= 5 && /^[a-zA-Z-]+$/.test(w));
+function makeMcqFromSentence(sentence, wordPool) {
+  // pick answer from wordPool that appears in sentence
+  const lower = sentence.toLowerCase();
+  const candidates = wordPool.filter((w) => lower.includes(w));
+  const usable = candidates.length ? candidates : wordPool;
 
-  // remove weak/common words
-  const stop = new Set([
-    "which","their","there","where","about","these","those","because","before","after",
-    "between","within","without","under","other","using","used","system","systems",
-    "process","processing","information","database","management","design","define",
-    "definition","describe","example","examples","important","different","various",
-    "chapter","course","module","section","student","students"
-  ]);
+  if (!usable.length) return null;
 
-  const strong = words.filter((w) => !stop.has(w.toLowerCase()));
-  const pool = strong.length >= 4 ? strong : words;
-  if (pool.length < 4) return null;
+  const answer = usable[Math.floor(Math.random() * usable.length)];
 
-  return pool[Math.floor(Math.random() * pool.length)];
-}
-
-function createMcq(sentence, globalPool) {
-  const answer = pickKeyword(sentence);
-  if (!answer) return null;
-
-  // escape regex chars safely
+  // hide answer in sentence
   const escaped = answer.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const question = sentence.replace(new RegExp(`\\b${escaped}\\b`, "i"), "_____");
 
-  const pool = (globalPool || []).filter((w) => w && w.length >= 5);
-  const distractorPool = pool.filter((w) => w.toLowerCase() !== answer.toLowerCase());
+  // distractors from pool (different)
+  const distractorPool = wordPool.filter((w) => w !== answer);
+  let distractors = shuffle(distractorPool).slice(0, 3);
 
-  let distractors = shuffle(distractorPool).filter((w, i, a) => a.findIndex(x => x.toLowerCase()===w.toLowerCase()) === i).slice(0, 3);
-  while (distrorsMissing(distractors)) distractors.push("None of the above");
+  while (distractors.length < 3) distractors.push("None-of-the-above");
 
   const options = shuffle([answer, ...distractors]).slice(0, 4);
-  const correctIndex = options.findIndex((o) => o.toLowerCase() === answer.toLowerCase());
+  const correctIndex = options.findIndex((o) => o === answer);
 
   return { type: "mcq", question, options, correctIndex };
 }
 
-function distrorsMissing(d) {
-  return (d || []).length < 3;
-}
+function generateQuizFromText(text, count) {
+  const wordPool = tokenizeWords(text);
+  const sentences = shuffle(splitSentences(text));
 
-function buildGlobalWordPool(text) {
-  const cleaned = cleanPdfText(text).replace(/[^\w\s-]/g, " ");
-  const words = cleaned
-    .split(/\s+/)
-    .map((w) => w.trim())
-    .filter((w) => w.length >= 5 && /^[a-zA-Z-]+$/.test(w));
-
-  // unique + shuffle
-  const uniq = [];
-  const seen = new Set();
-  for (const w of words) {
-    const k = w.toLowerCase();
-    if (!seen.has(k)) {
-      seen.add(k);
-      uniq.push(w);
-    }
-  }
-  return shuffle(uniq).slice(0, 300);
-}
-
-function generateQuizFromText(text, count = 5) {
-
-  const clean = String(text || "")
-    .replace(/\n+/g, " ")
-    .replace(/[^\w\s]/g, " ")
-    .trim();
-
-  const words = clean
-    .split(/\s+/)
-    .filter(w => w.length > 4);
-
-  if (words.length < 10) {
-    // fallback generic quiz
-    const fallback = [];
-    for (let i = 0; i < count; i++) {
-      fallback.push({
-        type: "mcq",
-        question: `Based on the document, which term is most relevant?`,
-        options: ["Concept", "Definition", "Process", "Structure"],
-        correctIndex: 0
-      });
-    }
-    return fallback;
-  }
+  // if no text at all -> fallback
+  if (!wordPool.length || !sentences.length) return buildFallbackQuestions(count);
 
   const quiz = [];
+  const seenQ = new Set();
 
-  for (let i = 0; i < count; i++) {
+  // create from sentences first
+  for (const s of sentences) {
+    if (quiz.length >= count) break;
+    const q = makeMcqFromSentence(s, wordPool);
+    if (!q) continue;
 
-    const answer = words[Math.floor(Math.random() * words.length)];
+    const key = q.question.toLowerCase();
+    if (seenQ.has(key)) continue;
+    seenQ.add(key);
 
-    const distractors = [];
+    quiz.push(q);
+  }
 
-    while (distractors.length < 3) {
-      const w = words[Math.floor(Math.random() * words.length)];
-      if (w !== answer && !distractors.includes(w)) distractors.push(w);
-    }
+  // if still short, generate “term present” style (still valid MCQ)
+  while (quiz.length < count) {
+    const answer = wordPool[Math.floor(Math.random() * wordPool.length)];
+    const distractors = shuffle(wordPool.filter((w) => w !== answer)).slice(0, 3);
+    while (distractors.length < 3) distractors.push("None-of-the-above");
 
-    const options = [answer, ...distractors].sort(() => Math.random() - 0.5);
-
+    const options = shuffle([answer, ...distractors]).slice(0, 4);
     quiz.push({
       type: "mcq",
-      question: `Which of the following terms appears in the document content?`,
+      question: "Which of the following terms appears in the document content?",
       options,
-      correctIndex: options.indexOf(answer)
+      correctIndex: options.findIndex((o) => o === answer),
     });
   }
 
-  return quiz;
+  return quiz.slice(0, count);
 }
-  // fallback: paragraphs -> convert to sentence-like chunks
-  if (items.length < count) {
-    const paras = shuffle(splitToParagraphs(cleaned));
-    for (const p of paras) {
-      if (items.length >= count) break;
-      const chunk = p.split(/(?<=[.!?])\s+/).slice(0, 2).join(" ");
-      const q = createMcq(chunk, globalPool);
-      if (!q) continue;
 
-      const key = q.question.toLowerCase();
-      if (seenQ.has(key)) continue;
-      seenQ.add(key);
-      items.push(q);
-    }
-  }
-
-  // last resort: if still short, generate from any lines
-  if (items.length < count) {
-    const lines = shuffle(cleaned.split("\n").map((l) => l.trim()).filter((l) => l.length >= 40 && l.length <= 220));
-    for (const l of lines) {
-      if (items.length >= count) break;
-      const q = createMcq(l, globalPool);
-      if (!q) continue;
-
-      const key = q.question.toLowerCase();
-      if (seenQ.has(key)) continue;
-      seenQ.add(key);
-      items.push(q);
-    }
-  }
-
-  return items.slice(0, count);
-
-
+// =====================
+// QUIZ ENDPOINT
+// =====================
 app.post("/api/quiz/generate", auth, (req, res) => {
   const docId = Number(req.body.docId);
-  const count = Math.max(1, Math.min(50, parseInt(req.body.count || 5, 10)));
+  const count = Math.max(1, Math.min(100, parseInt(req.body.count || 10, 10)));
 
-  db.get("SELECT title, content FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err, row) => {
-    if (!row) return res.status(404).json({ error: "Document not found" });
+  db.get(
+    "SELECT title, content FROM documents WHERE id = ? AND user_id = ?",
+    [docId, req.user.id],
+    (err, row) => {
+      if (!row) return res.status(404).json({ error: "Document not found" });
 
-    const quiz = generateQuizFromText(row.content || "", count);
+      const quiz = generateQuizFromText(row.content || "", count);
 
-    // ✅ NEVER return 0 unless the document truly has no text
-    if (!quiz.length) {
-      return res.status(400).json({
-        error: "Could not generate questions from this PDF text. Try uploading a clearer/text-based PDF.",
+      res.json({
+        ok: true,
+        poweredBy: "ARION",
+        owner: "Oderinu Marvelous",
+        docTitle: row.title,
+        quiz,
       });
     }
-
-    res.json({ ok: true, poweredBy: "ARION", owner: "Oderinu Marvelous", docTitle: row.title, quiz });
-  });
+  );
 });
 
 // =====================
 // ATTEMPTS + ANALYTICS
 // =====================
-
-// ✅ SAVE attempt (returns corrections data too)
 app.post("/api/attempts", auth, (req, res) => {
   const docId = Number(req.body.docId);
   const score = Number(req.body.score || 0);
   const total = Number(req.body.total || 0);
 
-  // optional payload for corrections
-  const corrections = Array.isArray(req.body.corrections) ? req.body.corrections : null;
-
-  if (!docId || !total) return res.status(400).json({ error: "docId, score, total required" });
+  if (!docId || !total)
+    return res.status(400).json({ error: "docId, score, total required" });
 
   const percent = total > 0 ? (score / total) * 100 : 0;
 
@@ -578,14 +578,10 @@ app.post("/api/attempts", auth, (req, res) => {
     function (err) {
       if (err) return res.status(500).json({ error: "DB insert error: " + err.message });
 
-      // ✅ return corrections back so frontend can show “Review”
       res.json({
         ok: true,
         attemptId: this.lastID,
         percent: Math.round(percent),
-        review: corrections
-          ? { available: true, corrections }
-          : { available: false, corrections: [] },
       });
     }
   );
@@ -664,7 +660,10 @@ app.get("/api/analytics/export", auth, (req, res) => {
       }
 
       doc.moveDown(2);
-      doc.fontSize(9).fillColor("gray").text("StudyFox • Powered by ARION", { align: "center" });
+      doc.fontSize(9).fillColor("gray").text("StudyFox • Powered by ARION • Oderinu Marvelous", {
+        align: "center",
+      });
+
       doc.end();
     }
   );
@@ -683,7 +682,11 @@ function wordsFromQuestion(q) {
   return cleanLine(q)
     .toLowerCase()
     .split(/[^a-z0-9]+/g)
-    .filter((w) => w.length >= 3 && !["what", "when", "where", "which", "that", "this", "with", "from", "into", "your"].includes(w));
+    .filter(
+      (w) =>
+        w.length >= 3 &&
+        !["what", "when", "where", "which", "that", "this", "with", "from", "into", "your"].includes(w)
+    );
 }
 function scoreParagraph(p, keys) {
   const lower = p.toLowerCase();
@@ -698,23 +701,27 @@ app.post("/api/qa", auth, (req, res) => {
   const question = String(req.body.question || "").trim();
   if (!docId || !question) return res.status(400).json({ error: "docId and question required" });
 
-  db.get("SELECT content FROM documents WHERE id = ? AND user_id = ?", [docId, req.user.id], (err, row) => {
-    if (!row) return res.status(404).json({ error: "Document not found" });
+  db.get(
+    "SELECT content FROM documents WHERE id = ? AND user_id = ?",
+    [docId, req.user.id],
+    (err, row) => {
+      if (!row) return res.status(404).json({ error: "Document not found" });
 
-    const keys = wordsFromQuestion(question);
-    const paras = splitParagraphs(row.content || "");
-    if (!paras.length) return res.json({ answer: "No readable text found in this document.", evidence: "" });
+      const keys = wordsFromQuestion(question);
+      const paras = splitParagraphs(row.content || "");
+      if (!paras.length) return res.json({ answer: "No readable text found in this document.", evidence: "" });
 
-    const ranked = paras
-      .map((p) => ({ p, s: scoreParagraph(p, keys) }))
-      .sort((a, b) => b.s - a.s);
+      const ranked = paras
+        .map((p) => ({ p, s: scoreParagraph(p, keys) }))
+        .sort((a, b) => b.s - a.s);
 
-    const best = ranked[0]?.p || paras[0];
-    res.json({
-      answer: `**${cleanLine(question)}**\n\n${best}`,
-      evidence: best.slice(0, 900),
-    });
-  });
+      const best = ranked[0]?.p || paras[0];
+      res.json({
+        answer: `**${cleanLine(question)}**\n\n${best}`,
+        evidence: best.slice(0, 900),
+      });
+    }
+  );
 });
 
 // =====================
@@ -723,7 +730,7 @@ app.post("/api/qa", auth, (req, res) => {
 app.get("/", (req, res) => {
   const indexFile = path.join(FRONTEND_PATH, "index.html");
   if (fs.existsSync(indexFile)) return res.sendFile(indexFile);
-  res.send("StudyFox backend is live ✅");
+  res.send("StudyFox backend is live ✅ — Oderinu Marvelous");
 });
 
 // =====================
@@ -738,6 +745,6 @@ app.use((err, req, res, next) => {
 // START
 // =====================
 app.listen(PORT, () => {
-  console.log(`✅ StudyFox running on http://127.0.0.1:${PORT}`);
-  console.log(`⚡ Powered by ARION`);
+  console.log(`✅ StudyFox running on port ${PORT}`);
+  console.log(`⚡ Powered by ARION — Oderinu Marvelous`);
 });
